@@ -50,6 +50,7 @@ import com.google.ai.edge.litertlm.ExperimentalApi
 import com.google.ai.edge.litertlm.ExperimentalFlags
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.MessageCallback
+import com.google.ai.edge.litertlm.RepetitionPenaltyConfig
 import com.google.ai.edge.litertlm.SamplerConfig
 import com.google.ai.edge.litertlm.ToolCall
 import com.google.ai.edge.litertlm.ToolProvider
@@ -141,8 +142,10 @@ object LlmChatModelHelper : LlmModelHelper {
     var supportsSpeculativeDecoding = false
     // Check if the model file supports speculative decoding.
     try {
-      com.google.ai.edge.litertlm.Capabilities(modelPath).use {
-        supportsSpeculativeDecoding = it.hasSpeculativeDecodingSupport()
+      com.google.ai.edge.litertlm.ModelInfo.from(modelPath).use { modelInfo ->
+        if (modelInfo is com.google.ai.edge.litertlm.ModelInfo.Llm) {
+          supportsSpeculativeDecoding = modelInfo.hasSpeculativeDecodingSupport()
+        }
       }
     } catch (e: Exception) {
       // Ignore exceptions and assume not supported.
@@ -234,7 +237,7 @@ object LlmChatModelHelper : LlmModelHelper {
     if (npuBackend && samplerOverride != null) {
       throw IllegalArgumentException(
         "temperature, top_p, top_k, and seed cannot be applied when the accelerator is " +
-          "$accelerator. LiteRT-LM 0.11 does not accept SamplerConfig on NPU or TPU."
+          "$accelerator. Gallery 1.0.23 still omits SamplerConfig on NPU and TPU."
       )
     }
     // close() throws if it is called twice. A previous failed reset may already have closed it,
@@ -289,7 +292,7 @@ object LlmChatModelHelper : LlmModelHelper {
     }
   }
 
-  @OptIn(ExperimentalApi::class) // getBenchmarkInfo is experimental in LiteRT-LM 0.11
+  @OptIn(ExperimentalApi::class) // getBenchmarkInfo is experimental in LiteRT-LM 0.18.1
   override fun readTokenUsage(model: Model): TokenUsageSnapshot? {
     val instance = model.instance as? LlmModelInstance ?: return null
     return try {
@@ -353,6 +356,10 @@ object LlmChatModelHelper : LlmModelHelper {
     coroutineScope: CoroutineScope?,
     extraContext: Map<String, String>?,
     onToolCall: (List<ToolCall>) -> Unit,
+    maxOutputTokens: Int?,
+    repetitionPenalty: Float?,
+    presencePenalty: Float?,
+    frequencyPenalty: Float?,
   ) {
     val instance = model.instance as? LlmModelInstance
     if (instance == null) {
@@ -384,6 +391,16 @@ object LlmChatModelHelper : LlmModelHelper {
     val finalExtraContext: Map<String, Any> =
       (extraContext ?: emptyMap()) + ("enable_thinking" to enableThinking)
 
+    val penaltyConfig =
+      if (repetitionPenalty != null || presencePenalty != null || frequencyPenalty != null) {
+        RepetitionPenaltyConfig(
+          repetitionPenalty = repetitionPenalty,
+          presencePenalty = presencePenalty,
+          frequencyPenalty = frequencyPenalty,
+        )
+      } else {
+        null
+      }
     conversation.sendMessageAsync(
       Contents.of(contents),
       object : MessageCallback {
@@ -412,6 +429,8 @@ object LlmChatModelHelper : LlmModelHelper {
         }
       },
       finalExtraContext,
+      repetitionPenaltyConfig = penaltyConfig,
+      maxOutputToken = maxOutputTokens,
     )
   }
 

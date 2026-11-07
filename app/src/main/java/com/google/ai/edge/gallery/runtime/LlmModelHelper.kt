@@ -155,6 +155,10 @@ interface LlmModelHelper {
     coroutineScope: CoroutineScope? = null,
     extraContext: Map<String, String>? = null,
     onToolCall: ((List<ToolCall>) -> Unit) = {},
+    maxOutputTokens: Int? = null,
+    repetitionPenalty: Float? = null,
+    presencePenalty: Float? = null,
+    frequencyPenalty: Float? = null,
   )
 
   /**

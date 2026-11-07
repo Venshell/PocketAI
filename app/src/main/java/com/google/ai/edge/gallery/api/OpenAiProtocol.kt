@@ -38,14 +38,15 @@ import kotlinx.serialization.json.jsonPrimitive
  * Token numbers are formatted only when the caller supplies counts from the runtime. Nothing in
  * this file estimates tokens from character length.
  *
- * LiteRT-LM 0.11 (the version this app ships) does not expose a per-request `max_output_tokens`
- * or a generation stop reason on [com.google.ai.edge.litertlm.Conversation]. Output caps are
- * therefore applied as a bound on streamed text pieces, and `finish_reason` is left null when the
- * runtime did not provide enough information to tell a stop token from the KV-cache limit.
+ * LiteRT-LM 0.18.1 (the runtime pinned by Google AI Edge Gallery 1.0.23) accepts
+ * `Conversation.sendMessageAsync(maxOutputToken)`. That limit counts thinking tokens and visible
+ * tokens together. The conversation callback still has no finish-reason argument, so `stop` is
+ * reported only when benchmark counts show the KV cache was not exhausted and the output budget
+ * was not consumed.
  */
 internal const val OUTPUT_LIMIT_HEADER = "X-PocketAI-Output-Limit"
 internal const val OUTPUT_LIMIT_HEADER_VALUE =
-  "max_tokens bounds streamed text pieces; litert-lm 0.11 has no max_output_tokens"
+  "max_tokens is LiteRT-LM 0.18.1 maxOutputToken and includes thinking tokens"
 
 internal data class ParsedToolCall(val id: String, val name: String, val arguments: String)
 
@@ -68,7 +69,10 @@ internal data class ParsedChatRequest(
   val topP: Double?,
   val topK: Int?,
   val seed: Int?,
-  val maxOutputPieces: Int?,
+  val maxOutputTokens: Int?,
+  val repetitionPenalty: Float?,
+  val presencePenalty: Float?,
+  val frequencyPenalty: Float?,
   val requestedModel: String?,
   val hadModelInput: Boolean,
 )
@@ -86,9 +90,6 @@ internal sealed class ParseOutcome {
 private val UNSUPPORTED_KEYS =
   setOf(
     "stop",
-    "frequency_penalty",
-    "presence_penalty",
-    "repetition_penalty",
     "logit_bias",
     "top_logprobs",
     "response_format",
@@ -136,8 +137,8 @@ internal fun parseChatBody(body: String): ParseOutcome {
   if (unsupported.isNotEmpty()) {
     return ParseOutcome.Rejected(
       "Unsupported parameter(s): ${unsupported.joinToString(", ")}. " +
-        "LiteRT-LM 0.11 does not implement them, so this server rejects the request instead of " +
-        "ignoring them."
+        "LiteRT-LM 0.18.1 does not expose them on the conversation API used here, so this " +
+        "server rejects the request instead of ignoring them."
     )
   }
 
@@ -156,6 +157,21 @@ internal fun parseChatBody(body: String): ParseOutcome {
   if (topK is ReadFailure) return ParseOutcome.Rejected(topK.message)
   val seed = readUnitInt(obj, "seed") { null }
   if (seed is ReadFailure) return ParseOutcome.Rejected(seed.message)
+  val repetitionPenalty =
+    readUnitDouble(obj, "repetition_penalty") { value ->
+      if (value < 1.0) "repetition_penalty must be >= 1" else null
+    }
+  if (repetitionPenalty is ReadFailure) return ParseOutcome.Rejected(repetitionPenalty.message)
+  val presencePenalty =
+    readUnitDouble(obj, "presence_penalty") { value ->
+      if (value < -2.0 || value > 2.0) "presence_penalty must be between -2 and 2" else null
+    }
+  if (presencePenalty is ReadFailure) return ParseOutcome.Rejected(presencePenalty.message)
+  val frequencyPenalty =
+    readUnitDouble(obj, "frequency_penalty") { value ->
+      if (value < -2.0 || value > 2.0) "frequency_penalty must be between -2 and 2" else null
+    }
+  if (frequencyPenalty is ReadFailure) return ParseOutcome.Rejected(frequencyPenalty.message)
 
   val maxTokens = readMaxOutputPieces(obj)
   if (maxTokens is ReadFailure) return ParseOutcome.Rejected(maxTokens.message)
@@ -240,7 +256,10 @@ internal fun parseChatBody(body: String): ParseOutcome {
       topP = (topP as ReadValue).value,
       topK = (topK as ReadValue).value,
       seed = (seed as ReadValue).value,
-      maxOutputPieces = (maxTokens as ReadValue).value,
+      maxOutputTokens = (maxTokens as ReadValue).value,
+      repetitionPenalty = (repetitionPenalty as ReadValue).value?.toFloat(),
+      presencePenalty = (presencePenalty as ReadValue).value?.toFloat(),
+      frequencyPenalty = (frequencyPenalty as ReadValue).value?.toFloat(),
       requestedModel = requested,
       hadModelInput = messages.isNotEmpty(),
     )
@@ -273,20 +292,28 @@ internal fun resolveTokenUsage(
 /**
  * Maps what this server can actually observe onto an OpenAI `finish_reason`.
  *
- * Returns null when the outcome would otherwise be a guess. LiteRT-LM 0.11 reports both stop-token
- * completion and KV-cache exhaustion through the same success callback; the KV-cache case is
- * recognizable only when benchmark token counts are available and their sum has reached the engine
- * context limit (`EngineConfig.maxNumTokens`).
+ * Returns null when the outcome would otherwise be a guess. LiteRT-LM 0.18.1 still reports
+ * stop-token completion, `maxOutputToken`, and KV-cache exhaustion through the same success
+ * callback. `length` is used when a context-limit error was observed, when decode tokens reached
+ * the requested [maxOutputTokens], or when benchmark counts reached `EngineConfig.maxNumTokens`.
  */
 internal fun resolveFinishReason(
   sawToolCalls: Boolean,
-  hitOutputPieceCap: Boolean,
   contextLimitTokens: Int?,
   usage: TokenUsage?,
   contextLimitError: Boolean,
+  maxOutputTokens: Int? = null,
 ): String? {
   if (sawToolCalls) return "tool_calls"
-  if (hitOutputPieceCap || contextLimitError) return "length"
+  if (contextLimitError) return "length"
+  if (
+    usage != null &&
+      maxOutputTokens != null &&
+      maxOutputTokens > 0 &&
+      usage.completionTokens >= maxOutputTokens
+  ) {
+    return "length"
+  }
   if (usage != null && contextLimitTokens != null && contextLimitTokens > 0) {
     val consumed = usage.promptTokens + usage.completionTokens
     return if (consumed >= contextLimitTokens) "length" else "stop"
