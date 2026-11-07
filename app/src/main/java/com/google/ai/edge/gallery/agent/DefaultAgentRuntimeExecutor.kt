@@ -30,9 +30,9 @@ import com.google.ai.edge.litertlm.ToolCall
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.channels.ProducerScope
 import kotlinx.coroutines.channels.awaitClose
-import kotlinx.coroutines.channels.onFailure
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.runBlocking
 
 private const val TAG = "AGDefaultAgentRuntimeExecutor"
 
@@ -88,7 +88,14 @@ open class DefaultAgentRuntimeExecutor(
   }
 
   private fun ProducerScope<AgentEvent>.emitEvent(event: AgentEvent) {
-    trySend(event).onFailure { Log.w(TAG, "Failed to emit event: $event", it) }
+    // The LiteRT callback arrives on a native thread, while the collector runs on the caller
+    // thread. Blocking here applies backpressure so a slow consumer cannot drop tokens or grow an
+    // unbounded buffer. trySend() used to discard events once the channel filled.
+    try {
+      runBlocking { send(event) }
+    } catch (e: Exception) {
+      Log.w(TAG, "Failed to emit event: $event", e)
+    }
   }
 
   override fun executeStream(

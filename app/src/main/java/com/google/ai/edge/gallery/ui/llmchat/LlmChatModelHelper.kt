@@ -37,6 +37,8 @@ import com.google.ai.edge.gallery.data.resetInitialization
 import com.google.ai.edge.gallery.runtime.CleanUpListener
 import com.google.ai.edge.gallery.runtime.LlmModelHelper
 import com.google.ai.edge.gallery.runtime.ResultListener
+import com.google.ai.edge.gallery.runtime.SamplerOverride
+import com.google.ai.edge.gallery.runtime.TokenUsageSnapshot
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
@@ -147,6 +149,9 @@ object LlmChatModelHelper : LlmModelHelper {
     }
     // Create an instance of LiteRT LM engine and conversation.
     try {
+      // Benchmark accounting is captured when the native engine is created. It is what exposes
+      // lastPrefillTokenCount / lastDecodeTokenCount. Sampling itself is unchanged.
+      val previousBenchmark = ExperimentalFlags.enableBenchmark
       var speculativeDecoding = false
       // Check if the model supports speculative decoding for the given task type and if the
       // speculative decoding is enabled in the settings.
@@ -161,11 +166,16 @@ object LlmChatModelHelper : LlmModelHelper {
             defaultValue = false,
           )
       }
-      ExperimentalFlags.enableSpeculativeDecoding = speculativeDecoding
       Log.d(TAG, "Speculative decoding enabled: $speculativeDecoding")
-      val engine = Engine(engineConfig)
-      engine.initialize()
-      ExperimentalFlags.enableSpeculativeDecoding = false
+      val engine =
+        try {
+          ExperimentalFlags.enableBenchmark = true
+          ExperimentalFlags.enableSpeculativeDecoding = speculativeDecoding
+          Engine(engineConfig).also { it.initialize() }
+        } finally {
+          ExperimentalFlags.enableBenchmark = previousBenchmark
+          ExperimentalFlags.enableSpeculativeDecoding = false
+        }
 
       ExperimentalFlags.enableConversationConstrainedDecoding =
         enableConversationConstrainedDecoding
@@ -208,41 +218,58 @@ object LlmChatModelHelper : LlmModelHelper {
     automaticToolCalling: Boolean,
     enableConversationConstrainedDecoding: Boolean,
     initialMessages: List<Message>,
+    samplerOverride: SamplerOverride?,
   ) {
+    Log.d(TAG, "Resetting conversation for model '${model.name}'")
+
+    val instance =
+      model.instance as LlmModelInstance?
+        ?: throw IllegalStateException("Model '${model.name}' is not initialized")
+    val accelerator =
+      model.getStringConfigValue(
+        key = ConfigKeys.ACCELERATOR,
+        defaultValue = Accelerator.GPU.label,
+      )
+    val npuBackend = accelerator == Accelerator.NPU.label || accelerator == Accelerator.TPU.label
+    if (npuBackend && samplerOverride != null) {
+      throw IllegalArgumentException(
+        "temperature, top_p, top_k, and seed cannot be applied when the accelerator is " +
+          "$accelerator. LiteRT-LM 0.11 does not accept SamplerConfig on NPU or TPU."
+      )
+    }
+    // close() throws if it is called twice. A previous failed reset may already have closed it,
+    // and the replacement still has to be created so the next request is not stuck on a dead
+    // conversation.
     try {
-      Log.d(TAG, "Resetting conversation for model '${model.name}'")
-
-      val instance = model.instance as LlmModelInstance? ?: return
       instance.conversation.close()
+    } catch (e: Exception) {
+      Log.w(TAG, "Previous conversation could not be closed cleanly", e)
+    }
 
-      val engine = instance.engine
-      val topK = model.getIntConfigValue(key = ConfigKeys.TOPK, defaultValue = DEFAULT_TOPK)
-      val topP = model.getFloatConfigValue(key = ConfigKeys.TOPP, defaultValue = DEFAULT_TOPP)
-      val temperature =
-        model.getFloatConfigValue(key = ConfigKeys.TEMPERATURE, defaultValue = DEFAULT_TEMPERATURE)
-      val shouldEnableImage = supportImage
-      val shouldEnableAudio = supportAudio
-      Log.d(TAG, "Enable image: $shouldEnableImage, enable audio: $shouldEnableAudio")
+    val engine = instance.engine
+    val topK = samplerOverride?.topK
+      ?: model.getIntConfigValue(key = ConfigKeys.TOPK, defaultValue = DEFAULT_TOPK)
+    val topP = samplerOverride?.topP
+      ?: model.getFloatConfigValue(key = ConfigKeys.TOPP, defaultValue = DEFAULT_TOPP).toDouble()
+    val temperature = samplerOverride?.temperature
+      ?: model.getFloatConfigValue(key = ConfigKeys.TEMPERATURE, defaultValue = DEFAULT_TEMPERATURE)
+        .toDouble()
+    val seed = samplerOverride?.seed ?: 0
+    val shouldEnableImage = supportImage
+    val shouldEnableAudio = supportAudio
+    Log.d(TAG, "Enable image: $shouldEnableImage, enable audio: $shouldEnableAudio")
 
-      val accelerator =
-        model.getStringConfigValue(
-          key = ConfigKeys.ACCELERATOR,
-          defaultValue = Accelerator.GPU.label,
-        )
+    try {
       ExperimentalFlags.enableConversationConstrainedDecoding =
         enableConversationConstrainedDecoding
       val newConversation =
         engine.createConversation(
           ConversationConfig(
             samplerConfig =
-              if (accelerator == Accelerator.NPU.label || accelerator == Accelerator.TPU.label) {
+              if (npuBackend) {
                 null
               } else {
-                SamplerConfig(
-                  topK = topK,
-                  topP = topP.toDouble(),
-                  temperature = temperature.toDouble(),
-                )
+                SamplerConfig(topK = topK, topP = topP, temperature = temperature, seed = seed)
               },
             systemInstruction = systemInstruction,
             tools = tools,
@@ -250,12 +277,30 @@ object LlmChatModelHelper : LlmModelHelper {
             initialMessages = initialMessages,
           )
         )
-      ExperimentalFlags.enableConversationConstrainedDecoding = false
       instance.conversation = newConversation
-
       Log.d(TAG, "Resetting done")
+    } catch (e: IllegalArgumentException) {
+      throw e
     } catch (e: Exception) {
-      Log.d(TAG, "Failed to reset conversation", e)
+      Log.w(TAG, "Failed to reset conversation", e)
+      throw IllegalStateException("Failed to rebuild conversation: ${e.message}", e)
+    } finally {
+      ExperimentalFlags.enableConversationConstrainedDecoding = false
+    }
+  }
+
+  @OptIn(ExperimentalApi::class) // getBenchmarkInfo is experimental in LiteRT-LM 0.11
+  override fun readTokenUsage(model: Model): TokenUsageSnapshot? {
+    val instance = model.instance as? LlmModelInstance ?: return null
+    return try {
+      val info = instance.conversation.getBenchmarkInfo()
+      TokenUsageSnapshot(
+        promptTokens = info.lastPrefillTokenCount,
+        completionTokens = info.lastDecodeTokenCount,
+      )
+    } catch (e: Exception) {
+      Log.w(TAG, "Native token counts are unavailable", e)
+      null
     }
   }
 

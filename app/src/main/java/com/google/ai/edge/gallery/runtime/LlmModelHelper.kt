@@ -31,6 +31,23 @@ typealias ResultListener =
 typealias CleanUpListener = () -> Unit
 
 /**
+ * Per-request sampler overrides. Null fields keep the values stored on the model.
+ *
+ * LiteRT-LM applies [com.google.ai.edge.litertlm.SamplerConfig] when a conversation is created, so
+ * these values take effect on the next [LlmModelHelper.resetConversation] rather than on an
+ * already-built conversation.
+ */
+data class SamplerOverride(
+  val temperature: Double? = null,
+  val topK: Int? = null,
+  val topP: Double? = null,
+  val seed: Int? = null,
+)
+
+/** Token counts measured by the runtime. Null at the call site means the runtime has no count. */
+data class TokenUsageSnapshot(val promptTokens: Int, val completionTokens: Int)
+
+/**
  * Base interface for all LLM runtimes. It defines the foundational operations needed to initialize,
  * manage conversations, execute inferences, and clean up resources for different Large Language
  * Model backends.
@@ -77,6 +94,12 @@ interface LlmModelHelper {
    *   executed automatically, enabling client-driven tool calling.
    * @param enableConversationConstrainedDecoding whether to enable constrained decoding.
    * @param initialMessages messages used to reinitialize conversation history on reset.
+   * @param samplerOverride sampling values that replace the model defaults for this conversation.
+   *   Backends that cannot apply a sampler must throw [IllegalArgumentException] when this is
+   *   non-null instead of dropping the values.
+   * @throws IllegalStateException when the conversation cannot be rebuilt. Callers must not run
+   *   inference after this returns exceptionally, because the previous conversation may already
+   *   have been closed.
    */
   fun resetConversation(
     model: Model,
@@ -87,7 +110,16 @@ interface LlmModelHelper {
     automaticToolCalling: Boolean = true,
     enableConversationConstrainedDecoding: Boolean = false,
     initialMessages: List<Message> = listOf(),
+    samplerOverride: SamplerOverride? = null,
   )
+
+  /**
+   * Token counts for the most recent turn, from the runtime's own accounting.
+   *
+   * Returns null when the runtime cannot measure tokens. Implementations must not substitute a
+   * character-length estimate.
+   */
+  fun readTokenUsage(model: Model): TokenUsageSnapshot? = null
 
   /**
    * Cleans up resources occupied by the model.

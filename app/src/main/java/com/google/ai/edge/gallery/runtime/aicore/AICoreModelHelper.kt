@@ -30,6 +30,7 @@ import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.runtime.CleanUpListener
 import com.google.ai.edge.gallery.runtime.LlmModelHelper
 import com.google.ai.edge.gallery.runtime.ResultListener
+import com.google.ai.edge.gallery.runtime.SamplerOverride
 import com.google.ai.edge.litertlm.Contents
 import com.google.ai.edge.litertlm.Message
 import com.google.ai.edge.litertlm.Role
@@ -51,7 +52,11 @@ import kotlinx.coroutines.launch
 
 private const val TAG = "AICoreModelHelper"
 
-data class AICoreChatMessage(val isUser: Boolean, val text: String)
+data class AICoreChatMessage(
+  val isUser: Boolean,
+  val text: String,
+  val role: String = if (isUser) "user" else "model",
+)
 
 data class AICoreModelInstance(
   val generativeModel: GenerativeModel,
@@ -203,13 +208,28 @@ object AICoreModelHelper : LlmModelHelper {
     automaticToolCalling: Boolean,
     enableConversationConstrainedDecoding: Boolean,
     initialMessages: List<Message>,
+    samplerOverride: SamplerOverride?,
   ) {
+    if (samplerOverride != null) {
+      throw IllegalArgumentException(
+        "Per-request temperature, top_p, top_k, and seed are not supported for AICore models."
+      )
+    }
     Log.d(TAG, "Resetting conversation for model '${model.name}'")
-    val instance = model.instance as? AICoreModelInstance ?: return
+    val instance =
+      model.instance as? AICoreModelInstance
+        ?: throw IllegalStateException("Model '${model.name}' is not initialized")
     instance.chatHistory.clear()
     for (msg in initialMessages) {
+      val role =
+        when (msg.role) {
+          Role.USER -> "user"
+          Role.SYSTEM -> "system"
+          Role.TOOL -> "tool"
+          Role.MODEL -> "model"
+        }
       instance.chatHistory.add(
-        AICoreChatMessage(isUser = (msg.role == Role.USER), text = msg.contents.toString())
+        AICoreChatMessage(isUser = msg.role == Role.USER, text = msg.contents.toString(), role = role)
       )
     }
     Log.d(TAG, "Resetting done")
@@ -433,8 +453,7 @@ object AICoreModelHelper : LlmModelHelper {
   private fun formatChatPrompt(chatHistory: List<AICoreChatMessage>, input: String): String =
     buildString {
       for (message in chatHistory) {
-        val role = if (message.isUser) "user" else "model"
-        append(role).append(": ").append(message.text).append("\n")
+        append(message.role).append(": ").append(message.text).append("\n")
       }
       append("user: ").append(input).append("\nmodel: ")
     }
