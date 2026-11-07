@@ -69,11 +69,15 @@ android {
     }
   }
 
-  signingConfigs {
-    create("release") {
-      val propsFile = rootProject.file("local/keystore/keystore.properties")
-      if (propsFile.exists()) {
-        val props = Properties().apply { load(propsFile.inputStream()) }
+  // CI and fresh checkouts have no local/keystore. Creating a release SigningConfig
+  // without storeFile makes AGP 9 fail at package*Release ("missing required property
+  // storeFile"), so only register and attach it when the properties file is present.
+  // Otherwise the release APK is left unsigned.
+  val keystorePropsFile = rootProject.file("local/keystore/keystore.properties")
+  if (keystorePropsFile.exists()) {
+    signingConfigs {
+      create("release") {
+        val props = Properties().apply { load(keystorePropsFile.inputStream()) }
         storeFile = rootProject.file("local/keystore/${props.getProperty("storeFile")}")
         storePassword = props.getProperty("storePassword")
         keyAlias = props.getProperty("keyAlias")
@@ -86,7 +90,7 @@ android {
     release {
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("release")
+      signingConfigs.findByName("release")?.let { signingConfig = it }
     }
   }
   compileOptions {
