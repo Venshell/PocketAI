@@ -69,12 +69,27 @@ android {
     }
   }
 
+  // A release keystore lives outside the repo (local/keystore). CI and fresh clones
+  // do not have one. AGP 9 refuses to package a release variant whose signing config
+  // is missing storeFile, so only attach that config when the keystore is actually present.
+  val releaseKeystore =
+      run {
+        val propsFile = rootProject.file("local/keystore/keystore.properties")
+        if (!propsFile.exists()) {
+          null
+        } else {
+          val props = Properties().apply { propsFile.inputStream().use { load(it) } }
+          val store =
+              props.getProperty("storeFile")?.let { rootProject.file("local/keystore/$it") }
+          if (store != null && store.isFile) props to store else null
+        }
+      }
+
   signingConfigs {
-    create("release") {
-      val propsFile = rootProject.file("local/keystore/keystore.properties")
-      if (propsFile.exists()) {
-        val props = Properties().apply { load(propsFile.inputStream()) }
-        storeFile = rootProject.file("local/keystore/${props.getProperty("storeFile")}")
+    if (releaseKeystore != null) {
+      val (props, store) = releaseKeystore
+      create("release") {
+        storeFile = store
         storePassword = props.getProperty("storePassword")
         keyAlias = props.getProperty("keyAlias")
         keyPassword = props.getProperty("keyPassword")
@@ -86,7 +101,14 @@ android {
     release {
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("release")
+      signingConfig =
+          if (releaseKeystore != null) {
+            signingConfigs.getByName("release")
+          } else {
+            // Same fallback CI used before the AGP 9 upgrade: a debug-signed release APK
+            // that can still be installed from the workflow artifact.
+            signingConfigs.getByName("debug")
+          }
     }
   }
   compileOptions {
