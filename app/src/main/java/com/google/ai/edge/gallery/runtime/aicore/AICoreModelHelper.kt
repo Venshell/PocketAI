@@ -273,6 +273,10 @@ object AICoreModelHelper : LlmModelHelper {
     coroutineScope: CoroutineScope?,
     extraContext: Map<String, String>?,
     onToolCall: (List<ToolCall>) -> Unit,
+    maxOutputTokens: Int?,
+    repetitionPenalty: Float?,
+    presencePenalty: Float?,
+    frequencyPenalty: Float?,
   ) {
     val instance = model.instance as? AICoreModelInstance
     if (instance == null) {
@@ -297,11 +301,18 @@ object AICoreModelHelper : LlmModelHelper {
         .getFloatConfigValue(key = ConfigKeys.TEMPERATURE, defaultValue = DEFAULT_TEMPERATURE)
         .coerceIn(0.0f, 1.0f)
     val topK = model.getIntConfigValue(key = ConfigKeys.TOPK, defaultValue = DEFAULT_TOPK)
-    val maxOutputTokens =
-      model.getIntConfigValue(
-        key = ConfigKeys.MAX_OUTPUT_TOKENS,
-        defaultValue = DEFAULT_MAX_OUTPUT_TOKEN,
+    if (repetitionPenalty != null || presencePenalty != null || frequencyPenalty != null) {
+      onError(
+        "repetition_penalty, presence_penalty, and frequency_penalty are not supported for AICore models."
       )
+      return
+    }
+    val resolvedMaxOutputTokens =
+      maxOutputTokens
+        ?: model.getIntConfigValue(
+          key = ConfigKeys.MAX_OUTPUT_TOKENS,
+          defaultValue = DEFAULT_MAX_OUTPUT_TOKEN,
+        )
 
     instance.inferenceJob?.cancel()
 
@@ -311,7 +322,7 @@ object AICoreModelHelper : LlmModelHelper {
         prompt = prompt,
         temperature = temperature,
         topK = topK,
-        maxOutputTokens = maxOutputTokens,
+        maxOutputTokens = resolvedMaxOutputTokens,
         images = images,
         input = input,
         resultListener = resultListener,

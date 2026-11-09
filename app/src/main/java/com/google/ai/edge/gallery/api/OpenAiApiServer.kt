@@ -395,6 +395,17 @@ constructor(
         "Per-request temperature, top_p, top_k, and seed are not supported for AICore models.",
       )
     }
+    if (
+      model.runtimeType == RuntimeType.AICORE &&
+        (parsed.repetitionPenalty != null ||
+          parsed.presencePenalty != null ||
+          parsed.frequencyPenalty != null)
+    ) {
+      return jsonError(
+        Response.Status.BAD_REQUEST,
+        "repetition_penalty, presence_penalty, and frequency_penalty are not supported for AICore models.",
+      )
+    }
     val tools = parseTools(parsed.source)
     val request =
       ChatRequest(
@@ -403,7 +414,10 @@ constructor(
         images = images,
         stream = parsed.stream,
         samplerOverride = samplerOverride,
-        maxOutputPieces = parsed.maxOutputPieces,
+        maxOutputTokens = parsed.maxOutputTokens,
+        repetitionPenalty = parsed.repetitionPenalty,
+        presencePenalty = parsed.presencePenalty,
+        frequencyPenalty = parsed.frequencyPenalty,
         hadModelInput = parsed.hadModelInput,
         tools = tools,
         hasToolsField = (parsed.source["tools"] as? JsonArray)?.isNotEmpty() == true,
@@ -423,7 +437,7 @@ constructor(
       TAG,
       "Chat request: tools=${request.tools.size} names=${request.toolNames} " +
         "autoCall=${request.tools.isEmpty()} stream=${request.stream} " +
-        "maxOutputPieces=${request.maxOutputPieces} temperature=${request.samplerOverride?.temperature}",
+        "maxOutputTokens=${request.maxOutputTokens} temperature=${request.samplerOverride?.temperature}",
     )
 
     // Streaming must return the HTTP response before generation finishes, so the work is handed
@@ -561,7 +575,10 @@ constructor(
     val images: List<Bitmap>,
     val stream: Boolean,
     val samplerOverride: SamplerOverride?,
-    val maxOutputPieces: Int?,
+    val maxOutputTokens: Int?,
+    val repetitionPenalty: Float?,
+    val presencePenalty: Float?,
+    val frequencyPenalty: Float?,
     val hadModelInput: Boolean,
     val tools: List<ToolProvider>,
     val hasToolsField: Boolean = false,
@@ -680,8 +697,6 @@ constructor(
   private class TurnState {
     val text = StringBuilder()
     val toolCalls = mutableListOf<ToolCall>()
-    var pieces: Int = 0
-    var hitCap: Boolean = false
     var errorMessage: String? = null
     var contextLimitError: Boolean = false
     var promptTooLong: Boolean = false
@@ -725,7 +740,7 @@ constructor(
     res.addHeader("Access-Control-Allow-Origin", "*")
     res.addHeader("Cache-Control", "no-cache")
     res.addHeader("Connection", "keep-alive")
-    if (request.maxOutputPieces != null) {
+    if (request.maxOutputTokens != null) {
       res.addHeader(OUTPUT_LIMIT_HEADER, OUTPUT_LIMIT_HEADER_VALUE)
     }
     return res
@@ -750,22 +765,19 @@ constructor(
     val attachments = request.images.map { Attachment.ImageBitmap(it) }
     val metadata = mutableMapOf<String, Any>()
     if (request.tools.isNotEmpty()) metadata[AgentRequest.CAPTURE_TOOL_CALLS] = "true"
+    request.maxOutputTokens?.let { metadata[AgentRequest.MAX_OUTPUT_TOKENS] = it }
+    request.repetitionPenalty?.let { metadata[AgentRequest.REPETITION_PENALTY] = it }
+    request.presencePenalty?.let { metadata[AgentRequest.PRESENCE_PENALTY] = it }
+    request.frequencyPenalty?.let { metadata[AgentRequest.FREQUENCY_PENALTY] = it }
     val agentRequest =
       AgentRequest(query = request.prompt, attachments = attachments, metadata = metadata)
     val modelName = apiModelName(model)
     executor.executeStream(AgentExecutionContext(), agentRequest).collect { event ->
-      if (state.clientGone || state.hitCap) return@collect
+      if (state.clientGone) return@collect
       when (event) {
         is AgentEvent.StreamToken -> {
           lastDiagnostics.streamTokenEvents++
           if (event.token.isEmpty()) return@collect
-          val cap = request.maxOutputPieces
-          if (cap != null && state.pieces >= cap) {
-            state.hitCap = true
-            requestStop(model)
-            return@collect
-          }
-          state.pieces++
           state.text.append(event.token)
           val chunk =
             sseData(completionChunk(modelName, textDeltaJson(event.token), null, null, false))
@@ -773,10 +785,6 @@ constructor(
             state.clientGone = true
             requestStop(model)
             throw kotlinx.coroutines.CancellationException("client disconnected")
-          }
-          if (cap != null && state.pieces >= cap) {
-            state.hitCap = true
-            requestStop(model)
           }
         }
         is AgentEvent.ToolCalls -> {
@@ -791,7 +799,7 @@ constructor(
           }
         }
         is AgentEvent.Error -> {
-          if (state.hitCap || state.clientGone) return@collect
+          if (state.clientGone) return@collect
           if (isPromptTooLongMessage(event.errorMessage)) {
             state.promptTooLong = true
             state.errorMessage = event.errorMessage
@@ -818,7 +826,6 @@ constructor(
     if (
       state.errorMessage != null &&
         !state.contextLimitError &&
-        !state.hitCap &&
         state.toolCalls.isEmpty()
     ) {
       writeSse(body, sseData(errorJson(state.errorMessage!!, type = "server_error")))
@@ -844,7 +851,6 @@ constructor(
     if (
       state.errorMessage != null &&
         !state.contextLimitError &&
-        !state.hitCap &&
         state.toolCalls.isEmpty()
     ) {
       return jsonError(Response.Status.INTERNAL_ERROR, state.errorMessage!!, type = "server_error")
@@ -863,7 +869,7 @@ constructor(
         Response.Status.OK,
         completionJson(apiModelName(model), messageJson, finish, usage),
       )
-    if (request.maxOutputPieces != null) {
+    if (request.maxOutputTokens != null) {
       response.addHeader(OUTPUT_LIMIT_HEADER, OUTPUT_LIMIT_HEADER_VALUE)
     }
     return response
@@ -887,10 +893,10 @@ constructor(
   ): String? {
     return resolveFinishReason(
       sawToolCalls = state.toolCalls.isNotEmpty(),
-      hitOutputPieceCap = state.hitCap,
       contextLimitTokens = contextLimit(model),
       usage = usage,
       contextLimitError = state.contextLimitError,
+      maxOutputTokens = request.maxOutputTokens,
     )
   }
 
@@ -903,7 +909,7 @@ constructor(
     } else if (finish == null) {
       Log.i(
         TAG,
-        "finish_reason left null; LiteRT-LM 0.11 did not distinguish stop from length. " +
+        "finish_reason left null; LiteRT-LM 0.18.1 did not distinguish stop from length. " +
           "usage=$usage kvCacheLimit=$limit",
       )
     }

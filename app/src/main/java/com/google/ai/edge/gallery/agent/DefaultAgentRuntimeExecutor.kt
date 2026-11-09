@@ -127,6 +127,10 @@ open class DefaultAgentRuntimeExecutor(
     // Client-driven tool calling: when requested, forward model-emitted tool calls to the caller
     // as events instead of discarding them.
     val captureToolCalls = request.metadata[AgentRequest.CAPTURE_TOOL_CALLS] == "true"
+    val maxOutputTokens = request.metadata[AgentRequest.MAX_OUTPUT_TOKENS] as? Int
+    val repetitionPenalty = request.metadata[AgentRequest.REPETITION_PENALTY] as? Float
+    val presencePenalty = request.metadata[AgentRequest.PRESENCE_PENALTY] as? Float
+    val frequencyPenalty = request.metadata[AgentRequest.FREQUENCY_PENALTY] as? Float
     if (curModel.instance == null) {
       try {
         curModel.awaitInitialization()
@@ -178,6 +182,10 @@ open class DefaultAgentRuntimeExecutor(
           emitEvent(AgentEvent.ToolCalls(toolCalls = toolCalls))
         }
       },
+      maxOutputTokens = maxOutputTokens,
+      repetitionPenalty = repetitionPenalty,
+      presencePenalty = presencePenalty,
+      frequencyPenalty = frequencyPenalty,
     )
 
     awaitClose {

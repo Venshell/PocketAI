@@ -41,7 +41,7 @@ class OpenAiProtocolTest {
     assertEquals(listOf("system", "user", "assistant"), request.history.map { it.role })
     assertEquals("只用中文回答", request.history[0].text)
     assertEquals("Hello 你好", request.history[1].text)
-    assertNull(request.maxOutputPieces)
+    assertNull(request.maxOutputTokens)
     assertNull(request.temperature)
   }
 
@@ -74,6 +74,23 @@ class OpenAiProtocolTest {
   }
 
   @Test
+  fun appliesPenaltiesThatLiteRtLm0181CanPassThrough() {
+    val body =
+      """
+      {"messages":[{"role":"user","content":"hi"}],
+       "repetition_penalty":1.2,"presence_penalty":0.4,"frequency_penalty":-0.2}
+      """
+        .trimIndent()
+    val request = (parseChatBody(body) as ParseOutcome.Ok).request
+    assertEquals(1.2f, request.repetitionPenalty!!, 0.0001f)
+    assertEquals(0.4f, request.presencePenalty!!, 0.0001f)
+    assertEquals(-0.2f, request.frequencyPenalty!!, 0.0001f)
+    val low =
+      parseChatBody("""{"messages":[{"role":"user","content":"hi"}],"repetition_penalty":0.5}""")
+    assertTrue((low as ParseOutcome.Rejected).message.contains("repetition_penalty"))
+  }
+
+  @Test
   fun rejectsUnsupportedStopInsteadOfIgnoringIt() {
     val outcome = parseChatBody("""{"messages":[{"role":"user","content":"hi"}],"stop":["END"]}""")
     assertTrue(outcome is ParseOutcome.Rejected)
@@ -94,7 +111,7 @@ class OpenAiProtocolTest {
     assertEquals(0.5, request.topP!!, 0.0)
     assertEquals(8, request.topK)
     assertEquals(7, request.seed)
-    assertEquals(3, request.maxOutputPieces)
+    assertEquals(3, request.maxOutputTokens)
   }
 
   @Test
@@ -158,7 +175,6 @@ class OpenAiProtocolTest {
       "stop",
       resolveFinishReason(
         sawToolCalls = false,
-        hitOutputPieceCap = false,
         contextLimitTokens = 4000,
         usage = underLimit,
         contextLimitError = false,
@@ -168,7 +184,6 @@ class OpenAiProtocolTest {
       "length",
       resolveFinishReason(
         sawToolCalls = false,
-        hitOutputPieceCap = false,
         contextLimitTokens = 120,
         usage = underLimit,
         contextLimitError = false,
@@ -178,36 +193,35 @@ class OpenAiProtocolTest {
       "length",
       resolveFinishReason(
         sawToolCalls = false,
-        hitOutputPieceCap = true,
         contextLimitTokens = 4000,
         usage = underLimit,
         contextLimitError = false,
+        maxOutputTokens = 20,
       ),
     )
     assertEquals(
       "tool_calls",
       resolveFinishReason(
         sawToolCalls = true,
-        hitOutputPieceCap = true,
         contextLimitTokens = 4000,
         usage = underLimit,
         contextLimitError = false,
+        maxOutputTokens = 20,
       ),
     )
     assertNull(
       resolveFinishReason(
         sawToolCalls = false,
-        hitOutputPieceCap = false,
         contextLimitTokens = 4000,
         usage = null,
         contextLimitError = false,
+        maxOutputTokens = 8,
       )
     )
     assertEquals(
       "length",
       resolveFinishReason(
         sawToolCalls = false,
-        hitOutputPieceCap = false,
         contextLimitTokens = null,
         usage = null,
         contextLimitError = true,
