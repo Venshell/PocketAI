@@ -37,5 +37,13 @@ data class AgentRequest(
      * server for client-driven tool calling.
      */
     const val CAPTURE_TOOL_CALLS = "capture_tool_calls"
+
+    /** LiteRT-LM `maxOutputToken` for this turn. Value is an [Int]. */
+    const val MAX_OUTPUT_TOKENS = "max_output_tokens"
+
+    /** LiteRT-LM [com.google.ai.edge.litertlm.RepetitionPenaltyConfig] fields. Values are [Float]. */
+    const val REPETITION_PENALTY = "repetition_penalty"
+    const val PRESENCE_PENALTY = "presence_penalty"
+    const val FREQUENCY_PENALTY = "frequency_penalty"
   }
 }

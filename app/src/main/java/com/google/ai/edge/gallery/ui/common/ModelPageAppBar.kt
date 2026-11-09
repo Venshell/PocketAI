@@ -202,8 +202,10 @@ fun ModelPageAppBar(
     var supportsSpeculativeDecoding = false
     // Check if the model file supports speculative decoding.
     try {
-      com.google.ai.edge.litertlm.Capabilities(model.getPath(context)).use {
-        supportsSpeculativeDecoding = it.hasSpeculativeDecodingSupport()
+      com.google.ai.edge.litertlm.ModelInfo.from(model.getPath(context)).use { modelInfo ->
+        if (modelInfo is com.google.ai.edge.litertlm.ModelInfo.Llm) {
+          supportsSpeculativeDecoding = modelInfo.hasSpeculativeDecodingSupport()
+        }
       }
     } catch (e: Exception) {
       // Ignore exceptions and assume not supported.

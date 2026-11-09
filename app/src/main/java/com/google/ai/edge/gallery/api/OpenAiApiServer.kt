@@ -26,9 +26,13 @@ import com.google.ai.edge.gallery.agent.AgentRuntimeExecutor
 import com.google.ai.edge.gallery.agent.AiChatExecutor
 import com.google.ai.edge.gallery.agent.Attachment
 import com.google.ai.edge.gallery.data.BuiltInTaskId
-import com.google.ai.edge.gallery.data.Model
+import com.google.ai.edge.gallery.data.ConfigKeys
+import com.google.ai.edge.gallery.data.DEFAULT_MAX_TOKEN
 import com.google.ai.edge.gallery.data.KeepAliveStore
+import com.google.ai.edge.gallery.data.Model
+import com.google.ai.edge.gallery.data.RuntimeType
 import com.google.ai.edge.gallery.keepalive.ApiServerService
+import com.google.ai.edge.gallery.runtime.SamplerOverride
 import com.google.ai.edge.gallery.runtime.runtimeHelper
 import com.google.ai.edge.litertlm.Content
 import com.google.ai.edge.litertlm.Contents
@@ -39,9 +43,10 @@ import com.google.ai.edge.litertlm.ToolProvider
 import com.google.ai.edge.litertlm.tool
 import dagger.hilt.android.qualifiers.ApplicationContext
 import fi.iki.elonen.NanoHTTPD
-import java.io.ByteArrayInputStream
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 import java.util.concurrent.locks.ReentrantLock
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -52,6 +57,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
@@ -89,6 +95,16 @@ constructor(
   @Volatile private var activeModel: Model? = null
   /** Serializes inference: only one request runs at a time; others block and wait in queue. */
   private val inferenceLock = ReentrantLock()
+
+  /**
+   * Runs the critical section off the HTTP thread so a streaming response can be returned while
+   * tokens are still being generated. The single thread plus [inferenceLock] keeps the existing
+   * serial queue: a second request waits until the first generation (and its stream) finishes.
+   */
+  private val inferenceExecutor =
+    Executors.newSingleThreadExecutor { runnable ->
+      Thread(runnable, "openai-inference").apply { isDaemon = true }
+    }
 
   /** When non-null, requests to /v1 endpoints must present this token via Authorization Bearer. */
   @Volatile private var authToken: String? = null
@@ -335,63 +351,189 @@ constructor(
     }
 
     val body = readRequestBody(session)
-    val request = parseChatRequest(body, apiModelName(model))
-    if (request == null) {
-      lastDiagnostics = RequestDiagnostics(error = "Invalid request body")
-      return jsonError(Response.Status.BAD_REQUEST, "Invalid request body")
+    val parsed =
+      when (val outcome = parseChatBody(body)) {
+        is ParseOutcome.Rejected -> {
+          lastDiagnostics = RequestDiagnostics(error = outcome.message)
+          return jsonError(Response.Status.BAD_REQUEST, outcome.message)
+        }
+        is ParseOutcome.Ok -> outcome.request
+      }
+    val advertised = apiModelName(model)
+    val modelError = validateRequestedModel(parsed.requestedModel, advertised)
+    if (modelError != null) {
+      return jsonError(Response.Status.NOT_FOUND, modelError, type = "model_not_found")
     }
 
-    // Record diagnostics for the /debug endpoint.
-    lastDiagnostics = RequestDiagnostics(
-      hasToolsField = request.hasToolsField,
-      toolCount = request.tools.size,
-      toolNames = request.toolNames,
-      toolDescriptionJson = request.toolDescriptionJson,
-      automaticToolCalling = request.tools.isEmpty(),
-    )
+    val images = mutableListOf<Bitmap>()
+    for (url in parsed.imageDataUrls) {
+      val bitmap = decodeImageFromDataUrl(url)
+      if (bitmap == null) {
+        return jsonError(Response.Status.BAD_REQUEST, "Could not decode image_url")
+      }
+      images.add(bitmap)
+    }
+    val samplerOverride =
+      if (
+        parsed.temperature != null ||
+          parsed.topP != null ||
+          parsed.topK != null ||
+          parsed.seed != null
+      ) {
+        SamplerOverride(
+          temperature = parsed.temperature,
+          topK = parsed.topK,
+          topP = parsed.topP,
+          seed = parsed.seed,
+        )
+      } else {
+        null
+      }
+    if (samplerOverride != null && model.runtimeType == RuntimeType.AICORE) {
+      return jsonError(
+        Response.Status.BAD_REQUEST,
+        "Per-request temperature, top_p, top_k, and seed are not supported for AICore models.",
+      )
+    }
+    if (
+      model.runtimeType == RuntimeType.AICORE &&
+        (parsed.repetitionPenalty != null ||
+          parsed.presencePenalty != null ||
+          parsed.frequencyPenalty != null)
+    ) {
+      return jsonError(
+        Response.Status.BAD_REQUEST,
+        "repetition_penalty, presence_penalty, and frequency_penalty are not supported for AICore models.",
+      )
+    }
+    val tools = parseTools(parsed.source)
+    val request =
+      ChatRequest(
+        prompt = parsed.prompt,
+        historyMessages = buildHistory(parsed),
+        images = images,
+        stream = parsed.stream,
+        samplerOverride = samplerOverride,
+        maxOutputTokens = parsed.maxOutputTokens,
+        repetitionPenalty = parsed.repetitionPenalty,
+        presencePenalty = parsed.presencePenalty,
+        frequencyPenalty = parsed.frequencyPenalty,
+        hadModelInput = parsed.hadModelInput,
+        tools = tools,
+        hasToolsField = (parsed.source["tools"] as? JsonArray)?.isNotEmpty() == true,
+        toolNames = extractToolNames(parsed.source),
+        toolDescriptionJson = extractToolDescriptionJson(parsed.source),
+      )
+
+    lastDiagnostics =
+      RequestDiagnostics(
+        hasToolsField = request.hasToolsField,
+        toolCount = request.tools.size,
+        toolNames = request.toolNames,
+        toolDescriptionJson = request.toolDescriptionJson,
+        automaticToolCalling = request.tools.isEmpty(),
+      )
     Log.d(
       TAG,
       "Chat request: tools=${request.tools.size} names=${request.toolNames} " +
-        "autoCall=${request.tools.isEmpty()} stream=${request.stream}",
+        "autoCall=${request.tools.isEmpty()} stream=${request.stream} " +
+        "maxOutputTokens=${request.maxOutputTokens} temperature=${request.samplerOverride?.temperature}",
     )
 
-    // The underlying runtime is not concurrent-safe for multiple turns. Serialize inference:
-    // if another request is running, block this thread until it finishes (queue) instead of failing.
-    inferenceLock.lock()
-    return try {
-      // Rebuild the conversation from the full request history on every call. This gives the
-      // model multi-turn context AND cleanly resets when the client starts a new chat (a new
-      // request carries only its own history).
-      resetConversationForRequest(model, request)
-      if (request.stream) {
-        streamResponse(model, request)
-      } else {
-        runBlockingResponse(model, request)
+    // Streaming must return the HTTP response before generation finishes, so the work is handed
+    // to the inference thread. Non-streaming waits for that same thread, which is what keeps
+    // requests ordered.
+    return if (request.stream) {
+      streamResponse(model, request)
+    } else {
+      try {
+        inferenceExecutor.submit(Callable { runExclusive(model, request) }).get()
+      } catch (e: Exception) {
+        Log.e(TAG, "Chat completion failed", e)
+        jsonError(Response.Status.INTERNAL_ERROR, e.message ?: "Inference failed", type = "server_error")
       }
-    } finally {
-      inferenceLock.unlock()
     }
   }
 
   /** Rebuilds the model's conversation from [request.historyMessages] before inference. */
   private fun resetConversationForRequest(model: Model, request: ChatRequest) {
-    try {
-      val hasTools = request.tools.isNotEmpty()
-      model.runtimeHelper.resetConversation(
-        model = model,
-        supportImage = request.images.isNotEmpty(),
-        supportAudio = false,
-        systemInstruction = null,
-        tools = request.tools,
-        // Client-driven tool calling: hand tool calls back to the client instead of executing
-        // them server-side. When there are no tools, keep the original auto-execution behaviour.
-        automaticToolCalling = !hasTools,
-        // Constrained decoding helps the model emit well-formed tool call JSON.
-        enableConversationConstrainedDecoding = hasTools,
-        initialMessages = request.historyMessages,
-      )
-    } catch (e: Exception) {
-      Log.w(TAG, "Failed to reset conversation for API request", e)
+    val hasTools = request.tools.isNotEmpty()
+    model.runtimeHelper.resetConversation(
+      model = model,
+      supportImage = request.images.isNotEmpty(),
+      supportAudio = false,
+      // System turns stay in [request.historyMessages] so their order relative to user and
+      // assistant turns is preserved. ConversationConfig.systemInstruction would always prepend
+      // them and is intentionally not used here.
+      systemInstruction = null,
+      tools = request.tools,
+      automaticToolCalling = !hasTools,
+      enableConversationConstrainedDecoding = hasTools,
+      initialMessages = request.historyMessages,
+      samplerOverride = request.samplerOverride,
+    )
+  }
+
+  private fun buildHistory(parsed: ParsedChatRequest): List<Message> {
+    val toolCallIdToName = mutableMapOf<String, String>()
+    val messages = mutableListOf<Message>()
+    for (msg in parsed.history) {
+      when (msg.role) {
+        "user" -> messages += Message.user(msg.text)
+        "system" -> messages += Message.system(msg.text)
+        "assistant" -> {
+          if (msg.toolCalls.isNotEmpty()) {
+            val calls = mutableListOf<ToolCall>()
+            for (call in msg.toolCalls) {
+              val args =
+                runCatching {
+                  @Suppress("UNCHECKED_CAST")
+                  jsonElementToAny(Json.parseToJsonElement(call.arguments)) as Map<String, Any>
+                }
+                  .getOrDefault(emptyMap())
+              calls += ToolCall(call.name, args)
+              if (call.id.isNotEmpty()) toolCallIdToName[call.id] = call.name
+            }
+            messages += Message.model(Contents.of(Content.Text(msg.text)), calls, emptyMap())
+          } else {
+            messages += Message.model(msg.text)
+          }
+        }
+        "tool" -> {
+          val name = toolCallIdToName[msg.toolCallId] ?: msg.name.orEmpty()
+          if (name.isNotEmpty()) {
+            val response: Any =
+              when (val content = msg.rawContent) {
+                is JsonNull, null -> msg.text
+                is JsonPrimitive -> content.content
+                else -> runCatching { jsonElementToAny(content) }.getOrDefault(msg.text)
+              }
+            messages += Message.tool(Contents.of(Content.ToolResponse(name, response)))
+          }
+        }
+      }
+    }
+    return messages
+  }
+
+  private fun runExclusive(model: Model, request: ChatRequest): Response {
+    inferenceLock.lock()
+    return try {
+      try {
+        resetConversationForRequest(model, request)
+      } catch (e: IllegalArgumentException) {
+        return jsonError(Response.Status.BAD_REQUEST, e.message ?: "Invalid request")
+      } catch (e: Exception) {
+        Log.w(TAG, "Failed to reset conversation for API request", e)
+        return jsonError(
+          Response.Status.INTERNAL_ERROR,
+          "Failed to rebuild conversation: ${e.message ?: "unknown error"}",
+          type = "server_error",
+        )
+      }
+      runBlockingResponse(model, request)
+    } finally {
+      inferenceLock.unlock()
     }
   }
 
@@ -432,10 +574,13 @@ constructor(
     val historyMessages: List<Message>,
     val images: List<Bitmap>,
     val stream: Boolean,
-    val temperature: Double?,
-    val maxTokens: Int?,
+    val samplerOverride: SamplerOverride?,
+    val maxOutputTokens: Int?,
+    val repetitionPenalty: Float?,
+    val presencePenalty: Float?,
+    val frequencyPenalty: Float?,
+    val hadModelInput: Boolean,
     val tools: List<ToolProvider>,
-    // Diagnostics only (used by /debug).
     val hasToolsField: Boolean = false,
     val toolNames: List<String> = emptyList(),
     val toolDescriptionJson: String = "",
@@ -449,149 +594,6 @@ constructor(
   private class OpenAiFunctionTool(private val descriptionJson: String) : OpenApiTool {
     override fun getToolDescriptionJsonString(): String = descriptionJson
     override fun execute(json: String): String = ""
-  }
-
-  private fun parseChatRequest(body: String, defaultModel: String): ChatRequest? {
-    return try {
-      val obj = Json.parseToJsonElement(body).jsonObject
-      val messages = obj["messages"]?.jsonArray ?: return null
-
-      // Convert all messages to LiteRT messages (except the last user one, which becomes the prompt).
-      val litertMessages = mutableListOf<Message>()
-      val images = mutableListOf<Bitmap>()
-      var prompt: String? = null
-      // Maps OpenAI tool_call_id -> tool name so that subsequent `tool` role messages can be
-      // converted to LiteRT Content.ToolResponse (which is keyed by tool name).
-      val toolCallIdToName = mutableMapOf<String, String>()
-
-      for ((index, msgEl) in messages.withIndex()) {
-        val msg = msgEl.jsonObject
-        val role = msg["role"]?.jsonPrimitive?.takeIf { it.isString }?.content ?: continue
-        val contentEl = msg["content"]
-        val isLast = index == messages.lastIndex
-
-        // content can be a plain string or an array of parts (text / image_url).
-        val textParts = mutableListOf<String>()
-        if (contentEl is JsonPrimitive) {
-          val text = contentEl.takeIf { it.isString }?.content
-          if (!text.isNullOrBlank()) textParts.add(text)
-        } else if (contentEl is JsonArray) {
-          for (part in contentEl) {
-            val partObj = part.jsonObject
-            val type = partObj["type"]?.jsonPrimitive?.takeIf { it.isString }?.content
-            when (type) {
-              "text" -> {
-                val text = partObj["text"]?.jsonPrimitive?.takeIf { it.isString }?.content
-                if (!text.isNullOrBlank()) textParts.add(text)
-              }
-              "image_url" -> {
-                val url =
-                  partObj["image_url"]?.jsonObject?.get("url")?.jsonPrimitive?.takeIf { it.isString }
-                    ?.content
-                if (url != null) {
-                  decodeImageFromDataUrl(url)?.let { images.add(it) }
-                }
-              }
-            }
-          }
-        }
-
-        val text = textParts.joinToString("\n")
-        when (role) {
-          "user" -> {
-            if (isLast) {
-              prompt = text
-            } else {
-              litertMessages.add(Message.user(text))
-            }
-          }
-          "assistant" -> {
-            val toolCallsEl = msg["tool_calls"]
-            if (toolCallsEl is JsonArray && toolCallsEl.isNotEmpty()) {
-              // Assistant message that requested tool calls. Convert to a LiteRT model message
-              // carrying the tool calls so the conversation history stays consistent.
-              val litertToolCalls = mutableListOf<ToolCall>()
-              for (tc in toolCallsEl) {
-                val tcObj = tc.jsonObject
-                val id = tcObj["id"]?.jsonPrimitive?.takeIf { it.isString }?.content ?: ""
-                val fnObj = tcObj["function"]?.jsonObject
-                val name = fnObj?.get("name")?.jsonPrimitive?.takeIf { it.isString }?.content ?: ""
-                val argsStr =
-                  fnObj?.get("arguments")?.jsonPrimitive?.takeIf { it.isString }?.content ?: "{}"
-                val argsMap =
-                  runCatching {
-                    jsonElementToAny(Json.parseToJsonElement(argsStr)) as Map<String, Any>
-                  }.getOrDefault(emptyMap<String, Any>())
-                if (name.isNotEmpty()) {
-                  litertToolCalls.add(ToolCall(name, argsMap))
-                  if (id.isNotEmpty()) toolCallIdToName[id] = name
-                }
-              }
-              if (litertToolCalls.isNotEmpty()) {
-                litertMessages.add(
-                  Message.model(
-                    Contents.of(Content.Text(text)),
-                    litertToolCalls,
-                    emptyMap(),
-                  )
-                )
-              } else {
-                litertMessages.add(Message.model(text))
-              }
-            } else {
-              litertMessages.add(Message.model(text))
-            }
-          }
-          "tool" -> {
-            // Tool result fed back by the client. Keyed by the tool name resolved from the
-            // preceding assistant tool_calls (or an explicit `name` field).
-            val name =
-              toolCallIdToName[msg["tool_call_id"]?.jsonPrimitive?.takeIf { it.isString }?.content]
-                ?: msg["name"]?.jsonPrimitive?.takeIf { it.isString }?.content
-                ?: ""
-            val response: Any =
-              when (contentEl) {
-                is JsonPrimitive -> contentEl.content
-                else -> contentEl?.let { runCatching { jsonElementToAny(it) }
-                  .getOrDefault("") } ?: ""
-              }
-            if (name.isNotEmpty()) {
-              litertMessages.add(Message.tool(Contents.of(Content.ToolResponse(name, response))))
-            }
-          }
-          // system messages are folded into the user prompt context implicitly; skip for now.
-        }
-      }
-
-      // The final prompt is the last `user` message. In a tool-calling round-trip the request may
-      // end with a `tool` (or assistant tool_calls) message instead — then there is no new user
-      // prompt and the model should continue from the tool result already in history, so allow an
-      // empty prompt here.
-      val finalPrompt = prompt ?: ""
-      val stream = obj["stream"]?.jsonPrimitive?.booleanOrNull ?: false
-      val temperature = obj["temperature"]?.jsonPrimitive?.doubleOrNull
-      val maxTokens =
-        obj["max_tokens"]?.jsonPrimitive?.intOrNull ?: obj["max_completion_tokens"]?.jsonPrimitive?.intOrNull
-      @Suppress("UNUSED_VARIABLE")
-      val requestedModel = obj["model"]?.jsonPrimitive?.takeIf { it.isString }?.content ?: defaultModel
-      val tools = parseTools(obj)
-      val hasToolsField = (obj["tools"] as? JsonArray)?.isNotEmpty() == true
-      ChatRequest(
-        prompt = finalPrompt,
-        historyMessages = litertMessages,
-        images = images,
-        stream = stream,
-        temperature = temperature,
-        maxTokens = maxTokens,
-        tools = tools,
-        hasToolsField = hasToolsField,
-        toolNames = extractToolNames(obj),
-        toolDescriptionJson = extractToolDescriptionJson(obj),
-      )
-    } catch (e: Exception) {
-      Log.w(TAG, "Failed to parse chat request", e)
-      null
-    }
   }
 
   /**
@@ -689,149 +691,272 @@ constructor(
   }
 
   ////////////////////////////////////////////////////////////////////////////////////////////////
-  // Streaming (SSE) response
+  // Generation
   ////////////////////////////////////////////////////////////////////////////////////////////////
 
-  private fun streamResponse(model: Model, request: ChatRequest): Response {
-    val sse = StringBuilder()
+  private class TurnState {
+    val text = StringBuilder()
     val toolCalls = mutableListOf<ToolCall>()
-    try {
-      runBlocking {
-        val attachments = request.images.map { Attachment.ImageBitmap(it) }
-        val metadata = mutableMapOf<String, Any>()
-        if (request.tools.isNotEmpty()) metadata[AgentRequest.CAPTURE_TOOL_CALLS] = "true"
-        val agentRequest =
-          AgentRequest(query = request.prompt, attachments = attachments, metadata = metadata)
-        executor.executeStream(AgentExecutionContext(), agentRequest).collect { event ->
-          when (event) {
-            is AgentEvent.StreamToken -> {
-              lastDiagnostics.streamTokenEvents++
-              if (event.token.isNotEmpty()) {
-                sse.append("data: ").append(chunkJson(apiModelName(model), event.token, finish = null)).append("\n\n")
-              }
-            }
-            is AgentEvent.ToolCalls -> {
-              lastDiagnostics.toolCallEvents++
-              toolCalls.addAll(event.toolCalls)
-              sse.append("data: ").append(toolCallChunkJson(apiModelName(model), event.toolCalls)).append("\n\n")
-            }
-            is AgentEvent.LoopTerminated -> {
-              val finish = if (toolCalls.isNotEmpty()) "tool_calls" else "stop"
-              sse.append("data: ").append(chunkJson(apiModelName(model), "", finish = finish)).append("\n\n")
-              sse.append("data: [DONE]\n\n")
-            }
-            is AgentEvent.Error -> {
-              sse.append("data: {\"error\":\"${escapeJson(event.errorMessage)}\"}\n\n")
-              sse.append("data: [DONE]\n\n")
-            }
-            else -> {}
-          }
-        }
-      }
-    } catch (e: Exception) {
-      Log.e(TAG, "Streaming error", e)
-      sse.append("data: {\"error\":\"${escapeJson(e.message ?: "unknown")}\"}\n\n")
-      sse.append("data: [DONE]\n\n")
-    }
+    var errorMessage: String? = null
+    var contextLimitError: Boolean = false
+    var promptTooLong: Boolean = false
+    var clientGone: Boolean = false
+  }
 
-    val res = newChunkedResponse(
-      Response.Status.OK,
-      "text/event-stream",
-      ByteArrayInputStream(sse.toString().toByteArray()),
-    )
+  private fun streamResponse(model: Model, request: ChatRequest): Response {
+    val body = SseBody(capacity = 4)
+    inferenceExecutor.execute {
+      inferenceLock.lock()
+      try {
+        try {
+          resetConversationForRequest(model, request)
+        } catch (e: IllegalArgumentException) {
+          writeSse(body, sseData(errorJson(e.message ?: "Invalid request")))
+          writeSse(body, sseDone())
+          return@execute
+        } catch (e: Exception) {
+          Log.w(TAG, "Failed to reset conversation for API request", e)
+          val message = "Failed to rebuild conversation: ${e.message ?: "unknown error"}"
+          writeSse(body, sseData(errorJson(message, type = "server_error")))
+          writeSse(body, sseDone())
+          return@execute
+        }
+        val state = TurnState()
+        try {
+          runBlocking { collectEvents(model, request, state, sink = body) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+          if (!state.clientGone) Log.i(TAG, "Generation cancelled", e)
+        } catch (e: Exception) {
+          Log.e(TAG, "Streaming error", e)
+          if (state.errorMessage == null) state.errorMessage = e.message ?: "unknown"
+        }
+        if (!state.clientGone) writeTerminal(body, model, request, state)
+      } finally {
+        body.complete()
+        inferenceLock.unlock()
+      }
+    }
+    val res = newChunkedResponse(Response.Status.OK, "text/event-stream", body)
     res.addHeader("Access-Control-Allow-Origin", "*")
     res.addHeader("Cache-Control", "no-cache")
+    res.addHeader("Connection", "keep-alive")
+    if (request.maxOutputTokens != null) {
+      res.addHeader(OUTPUT_LIMIT_HEADER, OUTPUT_LIMIT_HEADER_VALUE)
+    }
     return res
   }
 
-  private fun chunkJson(model: String, content: String, finish: String?): String {
-    val finishField = if (finish != null) "\"finish_reason\":\"$finish\"" else "\"finish_reason\":null"
-    val delta = if (content.isEmpty()) "{}" else "{\"content\":\"${escapeJson(content)}\"}"
-    return "{\"id\":\"chatcmpl-local\",\"object\":\"chat.completion.chunk\"," +
-      "\"created\":${System.currentTimeMillis() / 1000},\"model\":\"${escapeJson(model)}\"," +
-      "\"choices\":[{\"index\":0,\"delta\":$delta,$finishField}]}"
-  }
-
-  /** SSE chunk carrying a complete tool call (streaming tool calling). */
-  private fun toolCallChunkJson(model: String, toolCalls: List<ToolCall>): String {
-    val deltas =
-      toolCalls.mapIndexed { i, tc ->
-        "{\"index\":$i,\"id\":\"call_local_$i\",\"type\":\"function\"," +
-          "\"function\":{\"name\":\"${escapeJson(tc.name)}\"," +
-          "\"arguments\":\"${escapeJson(anyToJsonString(tc.arguments))}\"}}"
-      }.joinToString(",")
-    return "{\"id\":\"chatcmpl-local\",\"object\":\"chat.completion.chunk\"," +
-      "\"created\":${System.currentTimeMillis() / 1000},\"model\":\"${escapeJson(model)}\"," +
-      "\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[$deltas]},\"finish_reason\":null}]}"
-  }
-
-  ////////////////////////////////////////////////////////////////////////////////////////////////
-  // Non-streaming response
-  ////////////////////////////////////////////////////////////////////////////////////////////////
-
   private fun runBlockingResponse(model: Model, request: ChatRequest): Response {
-    val collected = StringBuilder()
-    val toolCalls = mutableListOf<ToolCall>()
-    var errorMessage: String? = null
+    val state = TurnState()
     try {
-      runBlocking {
-        val attachments = request.images.map { Attachment.ImageBitmap(it) }
-        val metadata = mutableMapOf<String, Any>()
-        if (request.tools.isNotEmpty()) metadata[AgentRequest.CAPTURE_TOOL_CALLS] = "true"
-        val agentRequest =
-          AgentRequest(query = request.prompt, attachments = attachments, metadata = metadata)
-        executor.executeStream(AgentExecutionContext(), agentRequest).collect { event ->
-          when (event) {
-            is AgentEvent.StreamToken -> {
-              lastDiagnostics.streamTokenEvents++
-              collected.append(event.token)
-            }
-            is AgentEvent.ToolCalls -> {
-              lastDiagnostics.toolCallEvents++
-              toolCalls.addAll(event.toolCalls)
-            }
-            is AgentEvent.Error -> errorMessage = event.errorMessage
-            else -> {}
+      runBlocking { collectEvents(model, request, state, sink = null) }
+    } catch (e: Exception) {
+      if (state.errorMessage == null) state.errorMessage = e.message ?: "unknown"
+    }
+    return completionResponse(model, request, state)
+  }
+
+  private suspend fun collectEvents(
+    model: Model,
+    request: ChatRequest,
+    state: TurnState,
+    sink: SseBody?,
+  ) {
+    val attachments = request.images.map { Attachment.ImageBitmap(it) }
+    val metadata = mutableMapOf<String, Any>()
+    if (request.tools.isNotEmpty()) metadata[AgentRequest.CAPTURE_TOOL_CALLS] = "true"
+    request.maxOutputTokens?.let { metadata[AgentRequest.MAX_OUTPUT_TOKENS] = it }
+    request.repetitionPenalty?.let { metadata[AgentRequest.REPETITION_PENALTY] = it }
+    request.presencePenalty?.let { metadata[AgentRequest.PRESENCE_PENALTY] = it }
+    request.frequencyPenalty?.let { metadata[AgentRequest.FREQUENCY_PENALTY] = it }
+    val agentRequest =
+      AgentRequest(query = request.prompt, attachments = attachments, metadata = metadata)
+    val modelName = apiModelName(model)
+    executor.executeStream(AgentExecutionContext(), agentRequest).collect { event ->
+      if (state.clientGone) return@collect
+      when (event) {
+        is AgentEvent.StreamToken -> {
+          lastDiagnostics.streamTokenEvents++
+          if (event.token.isEmpty()) return@collect
+          state.text.append(event.token)
+          val chunk =
+            sseData(completionChunk(modelName, textDeltaJson(event.token), null, null, false))
+          if (sink != null && !writeSse(sink, chunk)) {
+            state.clientGone = true
+            requestStop(model)
+            throw kotlinx.coroutines.CancellationException("client disconnected")
           }
         }
+        is AgentEvent.ToolCalls -> {
+          lastDiagnostics.toolCallEvents++
+          val start = state.toolCalls.size
+          state.toolCalls.addAll(event.toolCalls)
+          val toolChunk = sseData(toolCallChunkJson(modelName, event.toolCalls, start))
+          if (sink != null && !writeSse(sink, toolChunk)) {
+            state.clientGone = true
+            requestStop(model)
+            throw kotlinx.coroutines.CancellationException("client disconnected")
+          }
+        }
+        is AgentEvent.Error -> {
+          if (state.clientGone) return@collect
+          if (isPromptTooLongMessage(event.errorMessage)) {
+            state.promptTooLong = true
+            state.errorMessage = event.errorMessage
+          } else if (isContextLimitMessage(event.errorMessage)) {
+            state.contextLimitError = true
+          } else {
+            state.errorMessage = event.errorMessage
+          }
+        }
+        else -> {}
       }
-    } catch (e: Exception) {
-      errorMessage = e.message
     }
-
-    if (errorMessage != null) {
-      return jsonError(Response.Status.INTERNAL_ERROR, errorMessage!!)
-    }
-
-    // The model decided to call tools: hand the calls back to the client for execution.
-    if (toolCalls.isNotEmpty()) {
-      return jsonResponse(Response.Status.OK, toolCallsBody(apiModelName(model), request.prompt, toolCalls))
-    }
-
-    val content = escapeJson(collected.toString())
-    val body =
-      "{\"id\":\"chatcmpl-local\",\"object\":\"chat.completion\"," +
-        "\"created\":${System.currentTimeMillis() / 1000},\"model\":\"${escapeJson(apiModelName(model))}\"," +
-        "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"$content\"}," +
-        "\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":${request.prompt.length / 4}," +
-        "\"completion_tokens\":${collected.length / 4},\"total_tokens\":${(request.prompt.length + collected.length) / 4}}}"
-    return jsonResponse(Response.Status.OK, body)
   }
 
-  /** Non-streaming `chat.completion` body carrying the requested tool calls. */
-  private fun toolCallsBody(model: String, prompt: String, toolCalls: List<ToolCall>): String {
-    val calls =
-      toolCalls.mapIndexed { i, tc ->
-        "{\"id\":\"call_local_$i\",\"type\":\"function\"," +
+  private fun writeTerminal(body: SseBody, model: Model, request: ChatRequest, state: TurnState) {
+    if (state.promptTooLong) {
+      writeSse(
+        body,
+        sseData(errorJson(state.errorMessage ?: "Prompt exceeds the context limit")),
+      )
+      writeSse(body, sseDone())
+      return
+    }
+    if (
+      state.errorMessage != null &&
+        !state.contextLimitError &&
+        state.toolCalls.isEmpty()
+    ) {
+      writeSse(body, sseData(errorJson(state.errorMessage!!, type = "server_error")))
+      writeSse(body, sseDone())
+      return
+    }
+    val usage = measuredUsage(model, request, state)
+    val finish = measuredFinish(model, request, state, usage)
+    logFinish(finish, usage, contextLimit(model))
+    val chunk =
+      sseData(completionChunk(apiModelName(model), "{}", finish, usage, includeUsage = true))
+    writeSse(body, chunk)
+    writeSse(body, sseDone())
+  }
+
+  private fun completionResponse(model: Model, request: ChatRequest, state: TurnState): Response {
+    if (state.promptTooLong) {
+      return jsonError(
+        Response.Status.BAD_REQUEST,
+        state.errorMessage ?: "Prompt exceeds the context limit",
+      )
+    }
+    if (
+      state.errorMessage != null &&
+        !state.contextLimitError &&
+        state.toolCalls.isEmpty()
+    ) {
+      return jsonError(Response.Status.INTERNAL_ERROR, state.errorMessage!!, type = "server_error")
+    }
+    val usage = measuredUsage(model, request, state)
+    val finish = measuredFinish(model, request, state, usage)
+    logFinish(finish, usage, contextLimit(model))
+    val messageJson =
+      if (state.toolCalls.isNotEmpty()) {
+        "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[${toolCallObjects(state.toolCalls)}]}"
+      } else {
+        "{\"role\":\"assistant\",\"content\":\"${escapeJson(state.text.toString())}\"}"
+      }
+    val response =
+      jsonResponse(
+        Response.Status.OK,
+        completionJson(apiModelName(model), messageJson, finish, usage),
+      )
+    if (request.maxOutputTokens != null) {
+      response.addHeader(OUTPUT_LIMIT_HEADER, OUTPUT_LIMIT_HEADER_VALUE)
+    }
+    return response
+  }
+
+  private fun measuredUsage(model: Model, request: ChatRequest, state: TurnState): TokenUsage? {
+    val snapshot = model.runtimeHelper.readTokenUsage(model)
+    return resolveTokenUsage(
+      prefillTokens = snapshot?.promptTokens,
+      decodeTokens = snapshot?.completionTokens,
+      hadModelInput = request.hadModelInput,
+      hadVisibleOutput = state.text.isNotEmpty() || state.toolCalls.isNotEmpty(),
+    )
+  }
+
+  private fun measuredFinish(
+    model: Model,
+    request: ChatRequest,
+    state: TurnState,
+    usage: TokenUsage?,
+  ): String? {
+    return resolveFinishReason(
+      sawToolCalls = state.toolCalls.isNotEmpty(),
+      contextLimitTokens = contextLimit(model),
+      usage = usage,
+      contextLimitError = state.contextLimitError,
+      maxOutputTokens = request.maxOutputTokens,
+    )
+  }
+
+  private fun contextLimit(model: Model): Int =
+    model.getIntConfigValue(ConfigKeys.MAX_TOKENS, DEFAULT_MAX_TOKEN)
+
+  private fun logFinish(finish: String?, usage: TokenUsage?, limit: Int) {
+    if (finish == "length") {
+      Log.i(TAG, "finish_reason=length usage=$usage kvCacheLimit=$limit")
+    } else if (finish == null) {
+      Log.i(
+        TAG,
+        "finish_reason left null; LiteRT-LM 0.18.1 did not distinguish stop from length. " +
+          "usage=$usage kvCacheLimit=$limit",
+      )
+    }
+  }
+
+  private fun requestStop(model: Model) {
+    Thread({
+        try {
+          model.runtimeHelper.stopResponse(model)
+        } catch (e: Exception) {
+          Log.w(TAG, "Failed to cancel generation", e)
+        }
+      })
+      .apply {
+        isDaemon = true
+        name = "openai-cancel"
+        start()
+      }
+  }
+
+  private fun writeSse(body: SseBody, payload: String): Boolean =
+    body.write(payload.toByteArray(Charsets.UTF_8))
+
+  /** SSE chunk carrying a complete tool call (streaming tool calling). */
+  private fun toolCallChunkJson(model: String, toolCalls: List<ToolCall>, startIndex: Int): String {
+    val deltas =
+      toolCalls.mapIndexed { offset, tc ->
+        val index = startIndex + offset
+        "{\"index\":$index,\"id\":\"call_local_$index\",\"type\":\"function\"," +
           "\"function\":{\"name\":\"${escapeJson(tc.name)}\"," +
           "\"arguments\":\"${escapeJson(anyToJsonString(tc.arguments))}\"}}"
       }.joinToString(",")
-    return "{\"id\":\"chatcmpl-local\",\"object\":\"chat.completion\"," +
-      "\"created\":${System.currentTimeMillis() / 1000},\"model\":\"${escapeJson(model)}\"," +
-      "\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null," +
-      "\"tool_calls\":[$calls]},\"finish_reason\":\"tool_calls\"}]," +
-      "\"usage\":{\"prompt_tokens\":${prompt.length / 4},\"completion_tokens\":0," +
-      "\"total_tokens\":${prompt.length / 4}}}"
+    return completionChunk(
+      model = model,
+      deltaJson = "{\"tool_calls\":[$deltas]}",
+      finishReason = null,
+      usage = null,
+      includeUsage = false,
+    )
+  }
+
+  private fun toolCallObjects(toolCalls: List<ToolCall>): String {
+    return toolCalls.mapIndexed { i, tc ->
+      "{\"id\":\"call_local_$i\",\"type\":\"function\"," +
+        "\"function\":{\"name\":\"${escapeJson(tc.name)}\"," +
+        "\"arguments\":\"${escapeJson(anyToJsonString(tc.arguments))}\"}}"
+    }.joinToString(",")
   }
 
   /** Serializes a plain [Map]/`List` value (from a LiteRT [ToolCall]) back into a JSON string. */
@@ -860,8 +985,12 @@ constructor(
     return res
   }
 
-  private fun jsonError(status: Response.Status, message: String): Response {
-    return jsonResponse(status, "{\"error\":{\"message\":\"${escapeJson(message)}\"}}")
+  private fun jsonError(
+    status: Response.Status,
+    message: String,
+    type: String = "invalid_request_error",
+  ): Response {
+    return jsonResponse(status, errorJson(message, type))
   }
 
   private fun escapeJson(s: String): String {
